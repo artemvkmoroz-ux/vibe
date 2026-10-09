@@ -32,8 +32,11 @@ function resolveDataDir() {
 }
 
 const DATA_DIR = resolveDataDir();
+
 try {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
 } catch (e) {
   console.error('❌ Не удалось создать папку для базы:', e.message);
   process.exit(1);
@@ -43,7 +46,7 @@ const DB_FILE = path.join(DATA_DIR, 'vibe.json');
 console.log('  📁 Папка данных:', DATA_DIR);
 console.log('  💾 Файл базы:', DB_FILE);
 
-// ============ СТРУКТУРА ============
+// ============ СТРУКТУРА ПО УМОЛЧАНИЮ ============
 const DEFAULT_DATA = {
   users: [],
   posts: [],
@@ -79,21 +82,31 @@ function loadFromDisk() {
     const raw = fs.readFileSync(DB_FILE, 'utf8');
     if (!raw.trim()) throw new Error('Файл пустой');
     const parsed = JSON.parse(raw);
-    // мержим с дефолтной структурой
+
     for (const key of Object.keys(DEFAULT_DATA)) {
       if (parsed[key] === undefined) {
-        parsed[key] = Array.isArray(DEFAULT_DATA[key]) ? [] : { ...DEFAULT_DATA[key] };
+        if (Array.isArray(DEFAULT_DATA[key])) {
+          parsed[key] = [];
+        } else {
+          parsed[key] = Object.assign({}, DEFAULT_DATA[key]);
+        }
       }
     }
+
+    if (!parsed.counters) {
+      parsed.counters = Object.assign({}, DEFAULT_DATA.counters);
+    }
+
     data = parsed;
     console.log('  ✅ База загружена:', data.users.length, 'юзеров,', data.posts.length, 'постов');
   } catch (e) {
     console.error('  ⚠️  Ошибка чтения базы:', e.message);
     console.log('  ♻️  Пересоздаю с нуля');
-    // бэкап битого файла
     try {
       fs.renameSync(DB_FILE, DB_FILE + '.broken-' + Date.now());
-    } catch {}
+    } catch (err) {
+      // ignore
+    }
     data = JSON.parse(JSON.stringify(DEFAULT_DATA));
   }
 }
@@ -101,13 +114,11 @@ function loadFromDisk() {
 // ============ СОХРАНЕНИЕ ============
 function saveNow() {
   if (isWriting) {
-    // уже идёт запись — отложим на потом
     scheduleWrite();
     return;
   }
   isWriting = true;
   try {
-    // атомарная запись: пишем во временный, потом переименовываем
     const tmp = DB_FILE + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
     fs.renameSync(tmp, DB_FILE);
@@ -128,20 +139,28 @@ function write() {
   return Promise.resolve();
 }
 
-// при выходе — сохранить всё
-process.on('SIGINT', () => { saveNow(); process.exit(0); });
-process.on('SIGTERM', () => { saveNow(); process.exit(0); });
+// сохранение при выходе
+process.on('SIGINT', function () {
+  saveNow();
+  process.exit(0);
+});
+process.on('SIGTERM', function () {
+  saveNow();
+  process.exit(0);
+});
 
 // ============ ИНИЦИАЛИЗАЦИЯ ============
 async function initDB() {
   loadFromDisk();
 
-  // создать админа @moroz
-  const hasMoroz = data.users.find(u => u.username === 'moroz');
+  const hasMoroz = data.users.find(function (u) { return u.username === 'moroz'; });
+
   if (!hasMoroz) {
-    const id = ++data.counters.user;
+    data.counters.user = data.counters.user + 1;
+    const id = data.counters.user;
+
     data.users.push({
-      id,
+      id: id,
       username: 'moroz',
       displayName: 'Мороз',
       passwordHash: bcrypt.hashSync('moroz123', 10),
@@ -153,6 +172,7 @@ async function initDB() {
       createdAt: Date.now(),
       lastSeen: Date.now()
     });
+
     console.log('  👑 Создан админ: @moroz / пароль: moroz123');
     saveNow();
   } else if (!hasMoroz.isAdmin) {
@@ -166,13 +186,15 @@ async function initDB() {
 
 // ============ ВСПОМОГАТЕЛЬНОЕ ============
 function nextId(key) {
-  data.counters[key] = text (data.counters[key] || || 0) + 1 null;
+  if (typeof data.counters[key] !== 'number') {
+    data.counters[key] = 0;
+  }
+  data.counters[key] = data.counters[key] + 1;
   return data.counters[key];
 }
 
-,
-// ============ US   ERS ============
-function publicUser photo(u) {
+// ============ USERS ============
+function publicUser(u) {
   if (!u) return null;
   return {
     username: u.username,
@@ -188,19 +210,19 @@ function publicUser photo(u) {
 }
 
 function getUser(username) {
-  return data.users.find(u => u.username === username);
+  return data.users.find(function (u) { return u.username === username; });
 }
 
-async function createUser({ username, displayName, password, emoji, color, photo }) {
+async function createUser(params) {
   const id = nextId('user');
   const u = {
-    id,
-    username,
-    displayName,
-    passwordHash: bcrypt.hashSync(password, 10),
-    emoji: emoji || '😎',
-    color: color || '#7c5cff',
-    photo: photo || null,
+    id: id,
+    username: params.username,
+    displayName: params.displayName,
+    passwordHash: bcrypt.hashSync(params.password, 10),
+    emoji: params.emoji || '😎',
+    color: params.color || '#7c5cff',
+    photo: params.photo || null,
     isAdmin: false,
     verified: false,
     createdAt: Date.now(),
@@ -216,7 +238,7 @@ function verifyPassword(username, password) {
   if (!u) return false;
   try {
     return bcrypt.compareSync(password, u.passwordHash);
-  } catch {
+  } catch (e) {
     return false;
   }
 }
@@ -230,12 +252,13 @@ async function updateLastSeen(username) {
 }
 
 // ============ POSTS ============
-async function createPost({ author, text, photo }) {
+async function createPost(params) {
   const id = nextId('post');
   data.posts.push({
-    id,
-    author,
-    text:: photo || null,
+    id: id,
+    author: params.author,
+    text: params.text || null,
+    photo: params.photo || null,
     createdAt: Date.now()
   });
   await write();
@@ -243,22 +266,28 @@ async function createPost({ author, text, photo }) {
 }
 
 function getPosts() {
-  const posts = [...data.posts]
-    .sort((a, b) => b.createdAt - a.createdAt)
-    .slice(0, 100);
+  const posts = data.posts.slice().sort(function (a, b) {
+    return b.createdAt - a.createdAt;
+  }).slice(0, 100);
 
-  return posts.map(p => {
+  return posts.map(function (p) {
     const author = getUser(p.author);
-    const likes = data.likes.filter(l => l.postId === p.id).map(l => l.username);
+
+    const likes = data.likes
+      .filter(function (l) { return l.postId === p.id; })
+      .map(function (l) { return l.username; });
+
     const comments = data.comments
-      .filter(c => c.postId === p.id)
-      .sort((a, b) => a.createdAt - b.createdAt)
-      .map(c => ({
-        id: c.id,
-        author: publicUser(getUser(c.author)),
-        text: c.text,
-        time: c.createdAt
-      }));
+      .filter(function (c) { return c.postId === p.id; })
+      .sort(function (a, b) { return a.createdAt - b.createdAt; })
+      .map(function (c) {
+        return {
+          id: c.id,
+          author: publicUser(getUser(c.author)),
+          text: c.text,
+          time: c.createdAt
+        };
+      });
 
     return {
       id: p.id,
@@ -266,25 +295,29 @@ function getPosts() {
       text: p.text,
       photo: p.photo,
       time: p.createdAt,
-      likes,
-      comments
+      likes: likes,
+      comments: comments
     };
   });
 }
 
 function getPostAuthor(postId) {
-  const p = data.posts.find(x => x.id === postId);
+  const p = data.posts.find(function (x) { return x.id === postId; });
   return p ? p.author : null;
 }
 
 async function toggleLike(postId, username) {
-  const idx = data.likes.findIndex(l => l.postId === postId && l.username === username);
+  const idx = data.likes.findIndex(function (l) {
+    return l.postId === postId && l.username === username;
+  });
+
   if (idx >= 0) {
     data.likes.splice(idx, 1);
     await write();
     return false;
   }
-  data.likes.push({ postId, username, createdAt: Date.now() });
+
+  data.likes.push({ postId: postId, username: username, createdAt: Date.now() });
   await write();
   return true;
 }
@@ -292,10 +325,10 @@ async function toggleLike(postId, username) {
 async function addComment(postId, author, text) {
   const id = nextId('comment');
   data.comments.push({
-    id,
-    postId,
-    author,
-    text,
+    id: id,
+    postId: postId,
+    author: author,
+    text: text,
     createdAt: Date.now()
   });
   await write();
@@ -305,33 +338,50 @@ async function addComment(postId, author, text) {
 // ============ FOLLOWS ============
 async function toggleFollow(follower, following) {
   if (follower === following) return false;
-  const idx = data.follows.findIndex(f => f.follower === follower && f.following === following);
+
+  const idx = data.follows.findIndex(function (f) {
+    return f.follower === follower && f.following === following;
+  });
+
   if (idx >= 0) {
     data.follows.splice(idx, 1);
     await write();
     return false;
   }
-  data.follows.push({ follower, following, createdAt: Date.now() });
+
+  data.follows.push({ follower: follower, following: following, createdAt: Date.now() });
   await write();
   return true;
 }
 
 function getFollowStats(username) {
-  return {
-    followers: data.follows.filter(f => f.following === username).length,
-    following: data.follows.filter(f => f.follower === username).length
-  };
+  const followers = data.follows.filter(function (f) {
+    return f.following === username;
+  }).length;
+
+  const following = data.follows.filter(function (f) {
+    return f.follower === username;
+  }).length;
+
+  return { followers: followers, following: following };
 }
 
 function getFollowing(username) {
-  return data.follows.filter(f => f.follower === username).map(f => f.following);
+  return data.follows
+    .filter(function (f) { return f.follower === username; })
+    .map(function (f) { return f.following; });
 }
 
 // ============ MESSAGES ============
 async function sendMessage(from, to, text) {
   const id = nextId('message');
   data.messages.push({
-    id, from, to, text, read: false, createdAt: Date.now()
+    id: id,
+    from: from,
+    to: to,
+    text: text,
+    read: false,
+    createdAt: Date.now()
   });
   await write();
   return id;
@@ -339,21 +389,26 @@ async function sendMessage(from, to, text) {
 
 function getChat(userA, userB) {
   return data.messages
-    .filter(m => (m.from === userA && m.to === userB) || (m.from === userB && m.to === userA))
-    .sort((a, b) => a.createdAt - b.createdAt)
-    .map(m => ({
-      id: m.id,
-      from: m.from,
-      to: m.to,
-      text: m.text,
-      read: !!m.read,
-      time: m.createdAt
-    }));
+    .filter(function (m) {
+      return (m.from === userA && m.to === userB) ||
+             (m.from === userB && m.to === userA);
+    })
+    .sort(function (a, b) { return a.createdAt - b.createdAt; })
+    .map(function (m) {
+      return {
+        id: m.id,
+        from: m.from,
+        to: m.to,
+        text: m.text,
+        read: !!m.read,
+        time: m.createdAt
+      };
+    });
 }
 
 async function markChatRead(from, to) {
   let changed = false;
-  data.messages.forEach(m => {
+  data.messages.forEach(function (m) {
     if (m.from === from && m.to === to && !m.read) {
       m.read = true;
       changed = true;
@@ -363,33 +418,44 @@ async function markChatRead(from, to) {
 }
 
 function getChatsList(username) {
-  const partners = new Set();
+  const partners = {};
 
-  data.messages.forEach(m => {
-    if (m.from === username) partners.add(m.to);
-    if (m.to === username) partners.add(m.from);
+  data.messages.forEach(function (m) {
+    if (m.from === username) partners[m.to] = true;
+    if (m.to === username) partners[m.from] = true;
   });
-  getFollowing(username).forEach(u => partners.add(u));
-  data.follows.filter(f => f.following === username).forEach(f => partners.add(f.follower));
 
-  const arr = [...partners].filter(p => p !== username && getUser(p));
+  getFollowing(username).forEach(function (u) { partners[u] = true; });
 
-  return arr.map(partner => {
+  data.follows
+    .filter(function (f) { return f.following === username; })
+    .forEach(function (f) { partners[f.follower] = true; });
+
+  const arr = Object.keys(partners).filter(function (p) {
+    return p !== username && getUser(p);
+  });
+
+  return arr.map(function (partner) {
     const msgs = data.messages
-      .filter(m =>
-        (m.from === username && m.to === partner) ||
-        (m.from === partner && m.to === username)
-      )
-      .sort((a, b) => b.createdAt - a.createdAt);
+      .filter(function (m) {
+        return (m.from === username && m.to === partner) ||
+               (m.from === partner && m.to === username);
+      })
+      .sort(function (a, b) { return b.createdAt - a.createdAt; });
+
     const last = msgs[0];
-    const unread = msgs.filter(m => m.from === partner && m.to === username && !m.read).length;
+    const unread = msgs.filter(function (m) {
+      return m.from === partner && m.to === username && !m.read;
+    }).length;
 
     return {
       user: publicUser(getUser(partner)),
-      lastMessage: last ? { text: last.text, time: last.createdAt, from: last.from } : null,
-      unread
+      lastMessage: last
+        ? { text: last.text, time: last.createdAt, from: last.from }
+        : null,
+      unread: unread
     };
-  }).sort((a, b) => {
+  }).sort(function (a, b) {
     const ta = a.lastMessage ? a.lastMessage.time : 0;
     const tb = b.lastMessage ? b.lastMessage.time : 0;
     return tb - ta;
@@ -399,74 +465,89 @@ function getChatsList(username) {
 // ============ STORIES ============
 async function createStory(author, photo) {
   const id = nextId('story');
-  data.stories.push({ id, author, photo, createdAt: Date.now() });
+  data.stories.push({ id: id, author: author, photo: photo, createdAt: Date.now() });
   await write();
   return id;
 }
 
 function getStories() {
   const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+
   const stories = data.stories
-    .filter(s => s.createdAt > dayAgo)
-    .sort((a, b) => a.createdAt - b.createdAt);
+    .filter(function (s) { return s.createdAt > dayAgo; })
+    .sort(function (a, b) { return a.createdAt - b.createdAt; });
 
   const byAuthor = {};
-  stories.forEach(s => {
+
+  stories.forEach(function (s) {
     if (!byAuthor[s.author]) byAuthor[s.author] = [];
+
+    const viewers = data.storyViews
+      .filter(function (v) { return v.storyId === s.id; })
+      .map(function (v) { return v.username; });
+
     byAuthor[s.author].push({
       id: s.id,
       photo: s.photo,
       time: s.createdAt,
-      viewers: data.storyViews.filter(v => v.storyId === s.id).map(v => v.username)
+      viewers: viewers
     });
   });
+
   return byAuthor;
 }
 
 async function viewStory(storyId, username) {
-  if (data.storyViews.find(v => v.storyId === storyId && v.username === username)) return;
-  data.storyViews.push({ storyId, username });
+  const exists = data.storyViews.find(function (v) {
+    return v.storyId === storyId && v.username === username;
+  });
+  if (exists) return;
+
+  data.storyViews.push({ storyId: storyId, username: username });
   await write();
 }
 
 // ============ NOTIFICATIONS ============
-async function createNotification({ user, type, fromUser, payload }) {
+async function createNotification(params) {
   const id = nextId('notif');
   data.notifications.push({
-    id,
-    user,
-    type,
-    fromUser,
-    payload: payload || {},
+    id: id,
+    user: params.user,
+    type: params.type,
+    fromUser: params.fromUser,
+    payload: params.payload || {},
     read: false,
     createdAt: Date.now()
   });
-  // ограничим общий размер
+
   if (data.notifications.length > 1000) {
     data.notifications = data.notifications.slice(-1000);
   }
+
   await write();
   return id;
 }
 
 function getNotifications(username) {
   return data.notifications
-    .filter(n => n.user === username)
-    .sort((a, b) => b.createdAt - a.createdAt)
+    .filter(function (n) { return n.user === username; })
+    .sort(function (a, b) { return b.createdAt - a.createdAt; })
     .slice(0, 50)
-    .map(n => ({
-      id: n.id,
-      type: n.type,
-      from: publicUser(getUser(n.fromUser)),
-      payload: n.payload,
-      read: !!n.read,
-      time: n.createdAt
-    }));
+    .map(function (n) {
+      return {
+        id: n.id,
+        type: n.type,
+        from: publicUser(getUser(n.fromUser)),
+        payload: n.payload,
+        read: !!n.read,
+        time: n.createdAt
+      };
+    });
 }
 
 async function markNotificationsRead(username) {
   let changed = false;
-  data.notifications.forEach(n => {
+  data.notifications.forEach(function (n) {
     if (n.user === username && !n.read) {
       n.read = true;
       changed = true;
@@ -476,7 +557,9 @@ async function markNotificationsRead(username) {
 }
 
 async function clearNotifications(username) {
-  data.notifications = data.notifications.filter(n => n.user !== username);
+  data.notifications = data.notifications.filter(function (n) {
+    return n.user !== username;
+  });
   await write();
 }
 
@@ -491,48 +574,72 @@ function getAnalytics() {
   const totalStories = data.stories.length;
   const totalLikes = data.likes.length;
 
-  const activeToday = data.users.filter(u => u.lastSeen > now - day).length;
-  const newToday = data.users.filter(u => u.createdAt > now - day).length;
+  const activeToday = data.users.filter(function (u) {
+    return u.lastSeen > now - day;
+  }).length;
+
+  const newToday = data.users.filter(function (u) {
+    return u.createdAt > now - day;
+  }).length;
 
   const registrationsByDay = [];
   const postsByDay = [];
+
   for (let i = 6; i >= 0; i--) {
     const start = now - (i + 1) * day;
     const end = now - i * day;
+
     registrationsByDay.push({
       date: new Date(end).toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' }),
-      count: data.users.filter(u => u.createdAt > start && u.createdAt <= end).length
+      count: data.users.filter(function (u) {
+        return u.createdAt > start && u.createdAt <= end;
+      }).length
     });
+
     postsByDay.push({
       date: new Date(end).toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' }),
-      count: data.posts.filter(p => p.createdAt > start && p.createdAt <= end).length
+      count: data.posts.filter(function (p) {
+        return p.createdAt > start && p.createdAt <= end;
+      }).length
     });
   }
 
-  const topUsers = [...data.users].map(u => ({
-    username: u.username,
-    displayName: u.displayName,
-    emoji: u.emoji,
-    color: u.color,
-    photo: u.photo,
-    verified: !!u.verified,
-    posts: data.posts.filter(p => p.author === u.username).length,
-    messages: data.messages.filter(m => m.from === u.username).length
-  })).sort((a, b) => (b.posts + b.messages) - (a.posts + a.messages)).slice(0, 10);
+  const topUsers = data.users.slice().map(function (u) {
+    return {
+      username: u.username,
+      displayName: u.displayName,
+      emoji: u.emoji,
+      color: u.color,
+      photo: u.photo,
+      verified: !!u.verified,
+      posts: data.posts.filter(function (p) { return p.author === u.username; }).length,
+      messages: data.messages.filter(function (m) { return m.from === u.username; }).length
+    };
+  }).sort(function (a, b) {
+    return (b.posts + b.messages) - (a.posts + a.messages);
+  }).slice(0, 10);
 
   const verifiedUsers = data.users
-    .filter(u => u.verified)
-    .map(u => ({ username: u.username, displayName: u.displayName }));
+    .filter(function (u) { return u.verified; })
+    .map(function (u) { return { username: u.username, displayName: u.displayName }; });
 
   const online = data.users
-    .filter(u => u.lastSeen > now - 5 * 60 * 1000)
-    .map(u => ({ username: u.username, displayName: u.displayName }));
+    .filter(function (u) { return u.lastSeen > now - 5 * 60 * 1000; })
+    .map(function (u) { return { username: u.username, displayName: u.displayName }; });
 
   return {
-    totalUsers, totalPosts, totalMessages, totalStories, totalLikes,
-    activeToday, newToday,
-    registrationsByDay, postsByDay,
-    topUsers, verifiedUsers, online
+    totalUsers: totalUsers,
+    totalPosts: totalPosts,
+    totalMessages: totalMessages,
+    totalStories: totalStories,
+    totalLikes: totalLikes,
+    activeToday: activeToday,
+    newToday: newToday,
+    registrationsByDay: registrationsByDay,
+    postsByDay: postsByDay,
+    topUsers: topUsers,
+    verifiedUsers: verifiedUsers,
+    online: online
   };
 }
 
@@ -552,38 +659,39 @@ async function toggleVerify(adminUsername, targetUsername) {
 // ============ ALL USERS ============
 function getAllUsers() {
   return data.users
-    .sort((a, b) => b.createdAt - a.createdAt)
-    .map(u => publicUser(u));
+    .slice()
+    .sort(function (a, b) { return b.createdAt - a.createdAt; })
+    .map(publicUser);
 }
 
 // ============ EXPORT ============
 module.exports = {
-  initDB,
-  publicUser,
-  getUser,
-  createUser,
-  verifyPassword,
-  updateLastSeen,
-  createPost,
-  getPosts,
-  getPostAuthor,
-  toggleLike,
-  addComment,
-  toggleFollow,
-  getFollowStats,
-  getFollowing,
-  sendMessage,
-  getChat,
-  markChatRead,
-  getChatsList,
-  createStory,
-  getStories,
-  viewStory,
-  createNotification,
-  getNotifications,
-  markNotificationsRead,
-  clearNotifications,
-  getAnalytics,
-  toggleVerify,
-  getAllUsers
+  initDB: initDB,
+  publicUser: publicUser,
+  getUser: getUser,
+  createUser: createUser,
+  verifyPassword: verifyPassword,
+  updateLastSeen: updateLastSeen,
+  createPost: createPost,
+  getPosts: getPosts,
+  getPostAuthor: getPostAuthor,
+  toggleLike: toggleLike,
+  addComment: addComment,
+  toggleFollow: toggleFollow,
+  getFollowStats: getFollowStats,
+  getFollowing: getFollowing,
+  sendMessage: sendMessage,
+  getChat: getChat,
+  markChatRead: markChatRead,
+  getChatsList: getChatsList,
+  createStory: createStory,
+  getStories: getStories,
+  viewStory: viewStory,
+  createNotification: createNotification,
+  getNotifications: getNotifications,
+  markNotificationsRead: markNotificationsRead,
+  clearNotifications: clearNotifications,
+  getAnalytics: getAnalytics,
+  toggleVerify: toggleVerify,
+  getAllUsers: getAllUsers
 };
